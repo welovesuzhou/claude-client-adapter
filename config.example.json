@@ -6,17 +6,36 @@
   "debug": false,
   "models": [
     {
-      "localModelId": "claude-3-5-sonnet-20241022",
-      "remoteModelId": "provider-sonnet-compatible-model",
-      "remoteBaseUrl": "https://provider-a.example.com",
-      "remoteApiKey": "provider-a-api-key",
+      "localModelId": "claude-opus-4-5",
+      "remoteModelId": "provider-opus-model",
+      "remoteBaseUrl": "https://provider-a.example.com/anthropic",
+      "remoteApiKey": "your-provider-api-key",
       "enabled": true
     },
     {
-      "localModelId": "claude-3-5-haiku-20241022",
-      "remoteModelId": "provider-haiku-compatible-model",
-      "remoteBaseUrl": "https://provider-b.example.com",
-      "remoteApiKey": "",
+      "localModelId": "claude-sonnet-4-5",
+      "remoteModelId": "provider-sonnet-model",
+      "remoteBaseUrl": "https://provider-a.example.com/anthropic",
+      "remoteApiKey": "your-provider-api-key",
+      "enabled": true
+    },
+    {
+      "comment": "OpenAI-compatible backend — set remoteProtocol to openai",
+      "localModelId": "claude-opus-4-7",
+      "remoteModelId": "gpt-5.5",
+      "remoteBaseUrl": "https://openai-compatible-provider.example.com",
+      "remoteApiKey": "your-openai-compatible-api-key",
+      "remoteProtocol": "openai",
+      "enabled": false
+    }
+  ],
+  "imageModels": [
+    {
+      "comment": "Image generation via OpenAI-compatible provider",
+      "id": "gpt-image-1",
+      "remoteModelId": "gpt-image-1",
+      "remoteBaseUrl": "https://openai-compatible-provider.example.com",
+      "remoteApiKey": "your-openai-compatible-api-key",
       "enabled": false
     }
   ]

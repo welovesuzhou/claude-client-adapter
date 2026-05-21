@@ -96,13 +96,15 @@ test("saveWebConfig writes multiple model routes", async (t) => {
     source: "claude-sonnet",
     remoteModelId: "provider-sonnet",
     remoteBaseUrl: "https://sonnet.example.com",
-    remoteApiKey: "sonnet-key"
+    remoteApiKey: "sonnet-key",
+    remoteProtocol: "anthropic"
   });
   assert.deepEqual(resolveModel(config, "claude-haiku"), {
     source: "claude-haiku",
     remoteModelId: "provider-haiku",
     remoteBaseUrl: "https://haiku.example.com",
-    remoteApiKey: "haiku-key"
+    remoteApiKey: "haiku-key",
+    remoteProtocol: "anthropic"
   });
 });
 
@@ -279,7 +281,8 @@ test("resolveModel maps exact model names", () => {
     source: "claude-3-5-sonnet-20241022",
     remoteModelId: "provider-sonnet",
     remoteBaseUrl: "https://example.com",
-    remoteApiKey: "key"
+    remoteApiKey: "key",
+    remoteProtocol: "anthropic"
   });
 });
 

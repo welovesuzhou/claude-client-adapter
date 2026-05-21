@@ -4,6 +4,8 @@
 // - Anthropic API overview, URL shape, and auth headers:
 //   https://platform.claude.com/docs/en/api/overview
 
+const { anthropicToOpenAI, openAIToAnthropic, pipeOpenAIStreamAsAnthropic } = require("./openai-adapter");
+
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "content-encoding",
@@ -123,6 +125,10 @@ async function forwardAnthropicRequest(req, res, config, route, resolveModel, lo
 
   if (!jsonLike) {
     const modelRoute = resolveDefaultRoute(config);
+    if (modelRoute.remoteProtocol === "openai") {
+      sendJson(res, 400, { type: "error", error: { type: "invalid_request_error", message: "OpenAI 后端只支持 JSON 请求体。" } });
+      return;
+    }
     await pipeRemoteResponse(req, res, modelRoute, route, req, logger);
     return;
   }
@@ -134,32 +140,106 @@ async function forwardAnthropicRequest(req, res, config, route, resolveModel, lo
 
   if (bodyBuffer.length > 0) {
     body = parseJsonBody(bodyBuffer);
-    const modelNames = collectModelNames(body);
 
-    if (modelNames.length > 0) {
-      const rewrite = resolveModelRewrite(config, modelNames, resolveModel);
-      if (rewrite.error) {
-        sendJson(res, rewrite.statusCode, {
+    // Routing: use the top-level model field only to pick the backend.
+    // This avoids spurious "multi-model conflict" errors when nested structures
+    // (e.g. agent subagent configs) carry a different model name.
+    const primaryModelName = typeof body.model === "string" ? body.model : null;
+    if (primaryModelName) {
+      try {
+        modelRoute = resolveModel(config, primaryModelName);
+      } catch (error) {
+        sendJson(res, 400, {
           type: "error",
-          error: {
-            type: "invalid_request_error",
-            message: rewrite.error
-          }
-        });
-        await logger?.debug("模型映射失败", {
-          method: req.method,
-          route,
-          error: rewrite.error
+          error: { type: "invalid_request_error", message: error.message }
         });
         return;
       }
+    } else {
+      // No top-level model field — fall back to scanning nested fields
+      const modelNames = collectModelNames(body);
+      if (modelNames.length > 0) {
+        try {
+          modelRoute = resolveModel(config, modelNames[0]);
+        } catch (error) {
+          sendJson(res, 400, {
+            type: "error",
+            error: { type: "invalid_request_error", message: error.message }
+          });
+          return;
+        }
+      }
+    }
 
-      modelRoute = rewrite.modelRoute;
-      remoteBody = Buffer.from(JSON.stringify(rewriteModelNames(body, rewrite.modelMap)));
+    // Rewriting: remap ALL model fields in the body.
+    // Cross-backend models (nested) are rewritten to the primary route's remoteModelId.
+    const allModelNames = collectModelNames(body);
+    if (allModelNames.length > 0) {
+      const modelMap = buildModelMap(config, allModelNames, modelRoute, resolveModel);
+      remoteBody = Buffer.from(JSON.stringify(rewriteModelNames(body, modelMap)));
     }
   }
 
+  if (modelRoute.remoteProtocol === "openai") {
+    await forwardAnthropicToOpenAI(req, res, modelRoute, body || {}, logger);
+    return;
+  }
+
   await pipeRemoteResponse(req, res, modelRoute, route, remoteBody, logger);
+}
+
+async function forwardAnthropicToOpenAI(req, res, modelRoute, anthropicBody, logger) {
+  const isStream = Boolean(anthropicBody.stream);
+  const openAIBody = anthropicToOpenAI(anthropicBody, modelRoute.remoteModelId);
+  const remoteUrl = `${modelRoute.remoteBaseUrl}/v1/chat/completions`;
+
+  await logger?.debug("转发到 OpenAI 后端", {
+    method: "POST",
+    remoteUrl,
+    sourceModel: modelRoute.source,
+    targetModel: modelRoute.remoteModelId,
+    stream: isStream
+  });
+
+  const headers = {
+    "content-type": "application/json",
+    authorization: `Bearer ${modelRoute.remoteApiKey}`
+  };
+
+  const remoteResponse = await fetch(remoteUrl, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(openAIBody)
+  });
+
+  await logger?.debug("收到 OpenAI 后端响应", {
+    remoteUrl,
+    status: remoteResponse.status,
+    statusText: remoteResponse.statusText
+  });
+
+  if (!remoteResponse.ok) {
+    const errText = await remoteResponse.text().catch(() => "");
+    sendJson(res, remoteResponse.status, {
+      type: "error",
+      error: { type: "api_error", message: `上游 OpenAI 后端返回错误 ${remoteResponse.status}：${errText}` }
+    });
+    return;
+  }
+
+  if (isStream) {
+    res.setHeader("content-type", "text/event-stream; charset=utf-8");
+    res.setHeader("cache-control", "no-cache");
+    res.setHeader("x-accel-buffering", "no");
+    res.writeHead(200);
+    await pipeOpenAIStreamAsAnthropic(remoteResponse.body, res, modelRoute.source);
+    res.end();
+    return;
+  }
+
+  const oaiJson = await remoteResponse.json();
+  const anthropicResponse = openAIToAnthropic(oaiJson, modelRoute.source);
+  sendJson(res, 200, anthropicResponse);
 }
 
 async function pipeRemoteResponse(req, res, modelRoute, route, body, logger) {
@@ -233,7 +313,8 @@ function resolveDefaultRoute(config) {
     source: mapping.localModelId,
     remoteModelId: mapping.remoteModelId,
     remoteBaseUrl: mapping.remoteBaseUrl,
-    remoteApiKey: Object.prototype.hasOwnProperty.call(mapping, "remoteApiKey") ? mapping.remoteApiKey || "" : ""
+    remoteApiKey: Object.prototype.hasOwnProperty.call(mapping, "remoteApiKey") ? mapping.remoteApiKey || "" : "",
+    remoteProtocol: mapping.remoteProtocol || "anthropic"
   };
 }
 
@@ -279,36 +360,30 @@ function collectModelNames(value, models = []) {
   return models;
 }
 
-function resolveModelRewrite(config, modelNames, resolveModel) {
+/**
+ * Build a model-name → remoteModelId map for all model names found in the body.
+ * Models that resolve to the same backend as primaryRoute are rewritten to their own
+ * remoteModelId; models from a different backend are rewritten to primaryRoute's
+ * remoteModelId so the upstream never sees an alien model name.
+ */
+function buildModelMap(config, modelNames, primaryRoute, resolveModel) {
   const modelMap = new Map();
-  let selectedRoute = null;
 
   for (const modelName of new Set(modelNames)) {
     let route;
     try {
       route = resolveModel(config, modelName);
-    } catch (error) {
-      return { error: error.message, statusCode: 400 };
+    } catch {
+      route = primaryRoute;
     }
 
-    if (
-      selectedRoute &&
-      (selectedRoute.remoteBaseUrl !== route.remoteBaseUrl || selectedRoute.remoteApiKey !== route.remoteApiKey)
-    ) {
-      return {
-        error: "这个请求里包含多个模型，但它们映射到了不同的远程模型服务。请拆成多个请求发送。",
-        statusCode: 400
-      };
-    }
+    const sameBackend =
+      route.remoteBaseUrl === primaryRoute.remoteBaseUrl && route.remoteApiKey === primaryRoute.remoteApiKey;
 
-    selectedRoute = selectedRoute || route;
-    modelMap.set(modelName, route.remoteModelId);
+    modelMap.set(modelName, sameBackend ? route.remoteModelId : primaryRoute.remoteModelId);
   }
 
-  return {
-    modelRoute: selectedRoute,
-    modelMap
-  };
+  return modelMap;
 }
 
 function rewriteModelNames(value, modelMap) {
@@ -337,6 +412,34 @@ function sendJson(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
+async function forwardImageRequest(req, res, imageRoute, parsedBody, logger) {
+  const body = { ...(parsedBody || {}) };
+
+  // Override model with the resolved remoteModelId
+  body.model = imageRoute.remoteModelId;
+
+  const remoteUrl = `${imageRoute.remoteBaseUrl}/v1/images/generations`;
+
+  await logger?.debug("转发图片生成请求", { remoteUrl, model: imageRoute.remoteModelId });
+
+  const remoteResponse = await fetch(remoteUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${imageRoute.remoteApiKey}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  await logger?.debug("图片生成响应", { status: remoteResponse.status });
+
+  const responseBody = await remoteResponse.text();
+  res.setHeader("content-type", "application/json");
+  res.writeHead(remoteResponse.status);
+  res.end(responseBody);
+}
+
 module.exports = {
-  forwardAnthropicRequest
+  forwardAnthropicRequest,
+  forwardImageRequest
 };

@@ -258,8 +258,29 @@ function normalizeConfig(input, configPath) {
       port
     },
     debug,
-    models: normalizeModels(models)
+    models: normalizeModels(models),
+    imageModels: normalizeImageModels(input.imageModels || [])
   };
+}
+
+function normalizeImageModels(imageModels) {
+  if (!Array.isArray(imageModels)) return [];
+  return imageModels
+    .filter((m) => m && typeof m === "object" && m.enabled !== false)
+    .map((m) => ({
+      id: String(m.id || "").trim(),
+      remoteModelId: String(m.remoteModelId || m.id || "").trim(),
+      remoteBaseUrl: stripTrailingSlash(String(m.remoteBaseUrl || "").trim()),
+      remoteApiKey: String(m.remoteApiKey || "").trim()
+    }))
+    .filter((m) => m.id && m.remoteBaseUrl);
+}
+
+function resolveImageModel(config, modelId) {
+  const imageModels = config.imageModels || [];
+  const match = imageModels.find((m) => m.id === modelId) || imageModels[0];
+  if (!match) throw Object.assign(new Error("没有配置任何图片生成模型。"), { statusCode: 503 });
+  return match;
 }
 
 function normalizeModels(models) {
@@ -339,6 +360,10 @@ function normalizeModelArray(models) {
       normalizedMapping.remoteApiKey = value.remoteApiKey || "";
     }
 
+    if (value.remoteProtocol === "openai") {
+      normalizedMapping.remoteProtocol = "openai";
+    }
+
     seen.add(localModelId);
     normalized.push(normalizedMapping);
   }
@@ -365,7 +390,8 @@ function resolveModel(config, requestedModel) {
     source: mapping.localModelId,
     remoteModelId: mapping.remoteModelId,
     remoteBaseUrl: mapping.remoteBaseUrl,
-    remoteApiKey: modelApiKey(mapping)
+    remoteApiKey: modelApiKey(mapping),
+    remoteProtocol: mapping.remoteProtocol || "anthropic"
   };
 }
 
@@ -384,6 +410,7 @@ module.exports = {
   normalizeConfig,
   publicConfig,
   resolveModel,
+  resolveImageModel,
   saveSimpleConfig,
   saveWebConfig,
   writeStarterConfig

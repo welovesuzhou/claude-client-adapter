@@ -15,9 +15,10 @@ const {
   parseArgs,
   publicConfig,
   resolveModel,
+  resolveImageModel,
   saveWebConfig
 } = require("./config");
-const { forwardAnthropicRequest } = require("./forwarder");
+const { forwardAnthropicRequest, forwardImageRequest } = require("./forwarder");
 const { createLogger } = require("./logger");
 
 async function main() {
@@ -106,7 +107,42 @@ function createApp(state) {
   });
 
   app.get("/health", (req, res) => {
-    res.json({ ok: true, configured: Boolean(state.getConfig()) });
+    const config = state.getConfig();
+    res.json({
+      ok: true,
+      configured: Boolean(config),
+      models: config?.models?.filter((m) => m.enabled !== false).map((m) => m.localModelId) || [],
+      imageModels: config?.imageModels?.map((m) => m.id) || []
+    });
+  });
+
+  // OpenAI-compatible image generation endpoint
+  // POST /openai/v1/images/generations
+  app.post("/openai/v1/images/generations", express.json({ limit: "10mb" }), async (req, res, next) => {
+    const config = state.getConfig();
+    if (!config) {
+      res.status(503).json({ error: { type: "not_configured_error", message: "llm-model-forward 还没有完成配置。" } });
+      return;
+    }
+
+    try {
+      const body = req.body || {};
+      const imageRoute = resolveImageModel(config, body.model);
+      await forwardImageRequest(req, res, imageRoute, body, getLogger(state));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // List available image models
+  app.get("/openai/v1/models", (req, res) => {
+    const config = state.getConfig();
+    const imageModels = (config?.imageModels || []).map((m) => ({
+      id: m.id,
+      object: "model",
+      owned_by: "openai"
+    }));
+    res.json({ object: "list", data: imageModels });
   });
 
   app.all(/^\/anthropic(\/.*)?$/, async (req, res, next) => {
