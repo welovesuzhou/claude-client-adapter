@@ -1,9 +1,13 @@
 # llm-model-forward
 
-本地大模型 API 转发器。客户端连本机，真实请求按网页配置转发到远程模型服务。当前暂时只支持 Anthropic 接口。
+本地大模型 API 转发器。客户端连本机，真实请求按配置转发到远程模型服务。
+
+支持两种后端协议：
 
 ```text
-Anthropic/Claude 客户端 -> http://127.0.0.1:18787/anthropic -> 远程模型服务
+Claude / Anthropic 客户端 → http://127.0.0.1:18787/anthropic → 远程 Anthropic 兼容服务
+Claude / Anthropic 客户端 → http://127.0.0.1:18787/anthropic → 本地网关（协议转换）→ 远程 OpenAI 兼容服务
+任意 OpenAI 客户端       → http://127.0.0.1:18787/openai/v1/images/generations → 远程图片生成服务
 ```
 
 ![配置页面截图](docs/image.png)
@@ -69,6 +73,8 @@ pm2 startup
 
 `pm2 startup` 会输出一条需要复制执行的命令，照着执行一次即可。
 
+**注意：直接编辑 `config.json` 后需要执行 `pm2 restart llm-model-forward` 才能生效。**
+
 ## 本工具配置
 
 ### 网页后台配置（推荐）
@@ -77,7 +83,7 @@ pm2 startup
 
 <http://127.0.0.1:18787>
 
-在网页中点“新增”按钮，按网页中的提示设置即可。其中：
+在网页中点"新增"按钮，按网页中的提示设置即可。其中：
 
 - 远程模型参数，填写真实的大模型信息，例如 DeepSeek
 - 本地模型名可以任意填写，对于 Claude Desktop / Cowork App 场景，需要填 `claude` 开头的名字。
@@ -98,15 +104,39 @@ pm2 startup
   "debug": false,
   "models": [
     {
-      "localModelId": "claude-sonnet",
-      "remoteModelId": "provider-sonnet",
-      "remoteBaseUrl": "https://provider-a.example.com",
-      "remoteApiKey": "provider-a-api-key",
+      "localModelId": "claude-opus-4-5",
+      "remoteModelId": "your-anthropic-compatible-model",
+      "remoteBaseUrl": "https://provider-a.example.com/anthropic",
+      "remoteApiKey": "your-api-key",
+      "enabled": true
+    },
+    {
+      "localModelId": "claude-opus-4-7",
+      "remoteModelId": "gpt-5.5",
+      "remoteBaseUrl": "https://openai-compatible-provider.example.com",
+      "remoteApiKey": "your-openai-api-key",
+      "remoteProtocol": "openai",
+      "enabled": true
+    }
+  ],
+  "imageModels": [
+    {
+      "id": "gpt-image-1",
+      "remoteModelId": "gpt-image-1",
+      "remoteBaseUrl": "https://openai-compatible-provider.example.com",
+      "remoteApiKey": "your-openai-api-key",
       "enabled": true
     }
   ]
 }
 ```
+
+**`remoteProtocol` 字段说明：**
+
+| 值 | 说明 |
+|---|---|
+| 不填（默认） | Anthropic 协议透传，适合 DeepSeek 等 Anthropic 兼容服务 |
+| `"openai"` | 自动将 Anthropic 请求转换为 OpenAI Chat Completions 格式，适合 GPT 等服务 |
 
 ## Claude / Agent 客户端配置
 
@@ -122,9 +152,32 @@ http://127.0.0.1:18787/anthropic
 local-anything
 ```
 
-真正发给远程模型的密钥（API Key）来自网页配置；网页里没填时，不会向远程模型发送密钥。
+真正发给远程模型的密钥（API Key）来自配置文件；没填时，不会向远程模型发送密钥。
 
-模型名称 / Model ID：使用前面在网页中配置的本地模型名称。
+模型名称 / Model ID：使用前面配置的 `localModelId`。
+
+## 图片生成接口（OpenAI 格式）
+
+网关同时暴露 OpenAI 兼容的图片生成端点，供任意 OpenAI 客户端调用：
+
+```bash
+POST http://127.0.0.1:18787/openai/v1/images/generations
+Authorization: Bearer local-anything
+Content-Type: application/json
+
+{
+  "model": "gpt-image-1",
+  "prompt": "a red cat",
+  "n": 1,
+  "size": "1024x1024"
+}
+```
+
+查看已配置的图片模型：
+
+```bash
+GET http://127.0.0.1:18787/openai/v1/models
+```
 
 ## 安全性说明
 
@@ -132,13 +185,18 @@ local-anything
 
 转发接口时，只有当原始接口中包含了 API Key 字段，才会把 API Key 发给远程大模型接口，避免 API Key 泄露给不相关的接口。
 
+`config.json` 已加入 `.gitignore`，不会被 git 提交。
+
 ## 开发相关
 
 ### 实现思路
 
 - Node.js + Express 提供本地服务，EJS + Tailwind 提供配置页面。
-- `/anthropic/*` 会去掉 `/anthropic` 前缀，再转发到对应模型的 `remoteBaseUrl`。
-- 请求体里的 `model` 会按配置改成 `remoteModelId`；匹配不到时使用第一条启用的模型配置。
+- `/anthropic/*` 去掉前缀后，按顶层 `model` 字段选择模型路由：
+  - 若路由的 `remoteProtocol` 为 `openai`，自动将 Anthropic Messages 格式转换为 OpenAI Chat Completions 格式后转发，响应再转换回 Anthropic 格式（含流式 SSE、工具调用、视觉）。
+  - 否则直接透传给 Anthropic 兼容服务。
+- 嵌套结构中出现跨后端 `model` 引用时，自动归并到主路由的模型 ID，不报错。
+- `/openai/v1/images/generations` 代理图片生成请求，替换 API Key 后直接转发。
 - 如果客户端带了 `x-api-key` 或 `Authorization`，转发时会替换成 `remoteApiKey`；客户端没带鉴权头时不会主动添加。
 
 ### 测试
@@ -153,7 +211,16 @@ npm test
 curl http://127.0.0.1:18787/health
 ```
 
-返回 `{"ok":true,...}` 表示服务在运行。
+返回示例：
+
+```json
+{
+  "ok": true,
+  "configured": true,
+  "models": ["claude-opus-4-5", "claude-opus-4-7"],
+  "imageModels": ["gpt-image-1", "gpt-image-2"]
+}
+```
 
 ### 调试日志
 
